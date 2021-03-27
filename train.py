@@ -47,16 +47,16 @@ optimizer_cmD = torch.optim.Adam(cm_discriminator.parameters(), lr=opts.lr, beta
 
 def compute_gradient_penalty(D, real_samples, fake_samples):
     """Calculates the gradient penalty loss for WGAN GP"""
-    # Random weight term for interpolation between real and fake samples
+    # Random weight term for interpolation between real10k and fake samples
     alpha = torch.cuda.FloatTensor(np.random.random((real_samples.size(0), 1)))
-    # Get random interpolation between real and fake samples
+    # Get random interpolation between real10k and fake samples
     interpolates = (alpha * real_samples + ((1 - alpha) * fake_samples)).requires_grad_(True)
     d_interpolates = D(interpolates)
     fake = torch.autograd.Variable(torch.cuda.FloatTensor(real_samples.shape[0], 1).fill_(1.0), requires_grad=False)
     # Get gradient w.r.t. interpolates
     gradients = torch.autograd.grad(
         outputs=d_interpolates,  # fack samples
-        inputs=interpolates,   # real samples
+        inputs=interpolates,   # real10k samples
         grad_outputs=fake,
         create_graph=True,
         retain_graph=True,
@@ -226,16 +226,19 @@ def train(train_loader, model, criterion, optimizer, epoch):
     batch_time = AverageMeter()
     data_time = AverageMeter()
     tri_losses = AverageMeter()
-    cls_tri_losses = AverageMeter()
+
     losses = AverageMeter()
-    cm_losses = AverageMeter()
+
 
     if opts.semantic_reg:
         img_losses = AverageMeter()
         rec_losses = AverageMeter()
-    top1 = AverageMeter()
-    top5 = AverageMeter()
 
+    if opts.modality_alignment:
+        cm_losses = AverageMeter()
+
+    if opts.use_cat_triplet_loss:
+        cls_tri_losses = AverageMeter()
     # switch to train mode
     model.train()
 
@@ -261,40 +264,45 @@ def train(train_loader, model, criterion, optimizer, epoch):
         img_id_fea = output[0]
         rec_id_fea = output[1]
 
-        real_validity = cm_discriminator(img_id_fea.detach())
-        fake_validity = cm_discriminator(rec_id_fea.detach())
-        gradient_penalty = compute_gradient_penalty(cm_discriminator, img_id_fea.detach(), rec_id_fea.detach())
-        loss_cmD = -torch.mean(real_validity) + torch.mean(fake_validity) + 10 * gradient_penalty
-        optimizer_cmD.zero_grad()
-        loss_cmD.backward()
-        optimizer_cmD.step()
-
-        g_fake_validity = cm_discriminator(rec_id_fea)
-        loss_cmG = -torch.mean(g_fake_validity)
-        cm_losses.update(loss_cmG.data, input[0].size(0))
         # compute loss
+
+        tri_loss = global_loss(triplet_loss, torch.cat((img_id_fea, rec_id_fea)))[0]
+        tri_losses.update(tri_loss.data, input[0].size(0))
+
+        loss = triplet_loss
+        if opts.modality_alignment:
+            real_validity = cm_discriminator(img_id_fea.detach())
+            fake_validity = cm_discriminator(rec_id_fea.detach())
+            gradient_penalty = compute_gradient_penalty(cm_discriminator, img_id_fea.detach(), rec_id_fea.detach())
+            loss_cmD = -torch.mean(real_validity) + torch.mean(fake_validity) + 10 * gradient_penalty
+            optimizer_cmD.zero_grad()
+            loss_cmD.backward()
+            optimizer_cmD.step()
+
+            g_fake_validity = cm_discriminator(rec_id_fea)
+            loss_cmG = -torch.mean(g_fake_validity)
+            cm_losses.update(loss_cmG.data, input[0].size(0))
+            loss += opts.ma_weight * loss_cmG
+
         if opts.semantic_reg:
-            cls_tri_loss = class_global_loss(cls_triplet_loss, torch.cat((img_id_fea, rec_id_fea)),
-                                                   target_var[1], target_var[2])[0]
-            tri_loss = global_loss(triplet_loss, torch.cat((img_id_fea, rec_id_fea)))[0]
             img_loss = criterion[1](output[2], target_var[1])
             rec_loss = criterion[1](output[3], target_var[2])
-            # combined loss
-            loss = tri_loss + \
-                    opts.double_weight * cls_tri_loss + \
-                   0.005 * img_loss + \
-                   0.005 * rec_loss + 0.005 * loss_cmG
-
-            # measure performance and record losses
-            cls_tri_losses.update(cls_tri_loss.data, input[0].size(0))
-            tri_losses.update(tri_loss.data, input[0].size(0))
             img_losses.update(img_loss.data, input[0].size(0))
             rec_losses.update(rec_loss.data, input[0].size(0))
-            losses.update(loss.data, input[0].size(0))
-        else:
-            loss = criterion(output[0], output[1], target_var[0].float())
-            # measure performance and record loss
-            tri_losses.update(loss.data, input[0].size(0))
+            # combined loss
+            loss += opts.sr_img_weight * img_loss + opts.sr_rec_weight * rec_loss
+
+        if opts.use_cat_triplet_loss:
+            cls_tri_loss = class_global_loss(cls_triplet_loss, torch.cat((img_id_fea, rec_id_fea)),
+                                             target_var[1], target_var[2])[0]
+            cls_tri_losses.update(cls_tri_loss.data, input[0].size(0))
+            loss += opts.cat_triplet_weight * cls_tri_loss
+
+            # measure performance and record losses
+
+
+        losses.update(loss.data, input[0].size(0))
+
 
         # compute gradient and do Adam step
         optimizer.zero_grad()
@@ -305,26 +313,23 @@ def train(train_loader, model, criterion, optimizer, epoch):
         batch_time.update(time.time() - end)
         end = time.time()
 
-    if opts.semantic_reg:
-        print('Epoch: {0}\t'
-              'triplet loss {triplet_loss.val:.4f} ({triplet_loss.avg:.4f})\t'
-              'img Loss {img_loss.val:.4f} ({img_loss.avg:.4f})\t'
-              'rec loss {rec_loss.val:.4f} ({rec_loss.avg:.4f})\t'
-              'vision ({visionLR}) - recipe ({recipeLR})\t'.format(
-            epoch, triplet_loss=tri_losses, img_loss=img_losses,
-            rec_loss=rec_losses, visionLR=optimizer.param_groups[1]['lr'],
-            recipeLR=optimizer.param_groups[0]['lr']))
-        print('cmG loss {cm_loss.val:.4f} ({cm_loss.avg:.4f})\t'
-            'cls triplet loss {cls_tri_loss.val:.4f} ({cls_tri_loss.avg:.4f})\t'
-              'loss {loss.val:.4f} ({loss.avg:.4f})\t'.format(
-            cm_loss=cm_losses, loss=losses, cls_tri_loss=cls_tri_losses))
-    else:
-        print('Epoch: {0}\t'
-              'Loss {loss.val:.4f} ({loss.avg:.4f})\t'
-              'vision ({visionLR}) - recipe ({recipeLR})\t'.format(
-            epoch, loss=triplet_losses, visionLR=optimizer.param_groups[1]['lr'],
-            recipeLR=optimizer.param_groups[0]['lr']))
+    print('Epoch: {0}\t'
+          'triplet loss {triplet_loss.val:.4f} ({triplet_loss.avg:.4f})\t'
+          'Loss {loss.val:.4f} ({loss.avg:.4f})\t'
+          'vision ({visionLR}) - recipe ({recipeLR})\t'.format(
+        epoch, triplet_loss=tri_losses, loss=losses, visionLR=optimizer.param_groups[1]['lr'],
+        recipeLR=optimizer.param_groups[0]['lr']))
 
+    if opts.semantic_reg:
+        print('img Loss {img_loss.val:.4f} ({img_loss.avg:.4f})\t'
+              'rec loss {rec_loss.val:.4f} ({rec_loss.avg:.4f})\t'.format(
+            img_loss=img_losses, rec_loss=rec_losses))
+    if opts.modality_alignment:
+        print('cmG loss {cm_loss.val:.4f} ({cm_loss.avg:.4f})\t'.format(
+            cm_loss=cm_losses))
+    if opts.use_cat_triplet_loss:
+        print('cls triplet loss {cls_tri_loss.val:.4f} ({cls_tri_loss.avg:.4f})\t'.format(
+                    cls_tri_loss=cls_tri_losses))
 
 def validate(val_loader, model, criterion):
     batch_time = AverageMeter()

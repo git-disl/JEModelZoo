@@ -3,23 +3,55 @@ import torch
 from torch import nn
 from torch.autograd import Variable
 import numpy as np
+from args import get_parser
+
+# =============================================================================
+parser = get_parser()
+opts = parser.parse_args()
+# =============================================================================
+
+
 class TripletLoss(object):
   """Modified from Tong Xiao's open-reid (https://github.com/Cysu/open-reid). 
   Related Triplet Loss theory can be found in paper 'In Defense of the Triplet 
   Loss for Person Re-Identification'."""
   def __init__(self, device, gama=None, margin=None):
     self.device = device
-
-    print('using softmargin loss')
-    self.ranking_loss = nn.SoftMarginLoss()
     self.gama = gama
     self.margin = margin
+    if opts.use_circle_loss:
+        print('using circle loss')
+        self.ranking_loss = nn.SoftMarginLoss()
+    elif opts.use_soft_margin:
+        print('using softmargin based loss')
+        self.ranking_loss = nn.SoftMarginLoss()
+    else:
+        print('using hinge based loss')
+        self.ranking_loss = nn.MarginRankingLoss(margin=margin)
+
   def __call__(self, dist_ap, dist_an):
 
     with torch.cuda.device(self.device):
       y = Variable(dist_an.data.new().resize_as_(dist_an.data).fill_(-1)).cuda()
 
-      loss = self.ranking_loss(self.gama * (dist_ap - dist_an + self.margin), y)
+      if opts.use_circle_loss:
+          dist_ap = dist_ap / 2
+          dist_an = dist_an / 2
+
+          ap = torch.clamp(dist_ap.detach() + self.m, min=0.0)
+          an = torch.clamp(- dist_an.detach() + self.m + 1, min=0.0)
+          delta_p = self.m
+          delta_n = 1 - self.m
+
+          logit_p = ap * (dist_ap - delta_p)
+          logit_n = an * (dist_an - delta_n)
+          loss = self.ranking_loss(self.gama * (logit_n - logit_p), y)
+
+      elif opts.use_soft_margin:
+          loss = self.ranking_loss(self.gama * (dist_ap - dist_an + self.margin), y)
+
+      else:
+          loss = self.ranking_loss(dist_an, dist_ap, y)
     return loss
 
 def normalize(x, axis=-1):
